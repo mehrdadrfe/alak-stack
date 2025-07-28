@@ -1,0 +1,50 @@
+services:
+  alak-redis:
+    image: redis:alpine
+    container_name: alak-redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  alak-controller:
+    build: alak-controller
+    container_name: alak-controller
+    ports:
+      - "8080:8080"
+    restart: always
+    environment:
+      - REDIS_HOST=alak-redis:6379
+    depends_on:
+      - alak-redis
+
+  alak-geo:
+    build: alak-geo
+    container_name: alak-geo
+    ports:
+      - "8081:8081"
+    restart: always
+    volumes:
+      - ./alak-geo/geoip:/data
+
+  alak-gatekeeper:
+    build: alak-gatekeeper
+    container_name: alak-gatekeeper
+    ports:
+      - "8090:8090"
+    restart: always
+    environment:
+      - REDIS_HOST=alak-redis:6379
+      - ALAK_URL=http://alak-geo:8081/lookup
+    depends_on:
+      - alak-redis
+
+  alak-dashboard:
+    build: alak-dashboard
+    container_name: alak-dashboard
+    ports:
+      - "3000:3000"
+    restart: always
+    environment:
+      - NEXT_PUBLIC_API_URL=http://alak-controller:8080
+    depends_on:
+      - alak-controller
