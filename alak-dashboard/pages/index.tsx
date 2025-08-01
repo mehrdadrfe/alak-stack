@@ -1,153 +1,192 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import useSWR from 'swr';
 import Head from 'next/head';
 
 type Rule = {
   asn: string;
   country: string;
   tsp?: string;
-  city?: string;
   drop_percent: number;
   ttl?: number;
+  enabled?: boolean;
+};
+
+const fetcher = async (url: string) => {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 };
 
 export default function Home() {
-  const [rules, setRules] = useState<Rule[]>([]);
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+  const geoUrl = process.env.NEXT_PUBLIC_GEO_API_URL || 'http://localhost:8081';
+
+  const { data: rulesData, error: rulesError, mutate: reloadRules } = useSWR<Rule[]>(`${apiUrl}/rules`, fetcher, { refreshInterval: 5000 });
+  const rules: Rule[] = Array.isArray(rulesData) ? rulesData : [];
+
+  const [searchValue, setSearchValue] = useState('');
   const [asn, setAsn] = useState('');
-  const [country, setCountry] = useState('');
   const [tsp, setTsp] = useState('');
-  const [city, setCity] = useState('');
+  const [country, setCountry] = useState('');
   const [dropPercent, setDropPercent] = useState<number>(0);
   const [ttl, setTtl] = useState<number>(0);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [searchLoading, setSearchLoading] = useState<boolean>(false);
+  const [tspMatches, setTspMatches] = useState<any[]>([]);
 
-  const fetchRules = async () => {
+  // Unified Search (ASN or TSP)
+  const handleSearch = async () => {
+    if (!searchValue.trim()) return;
+    setSearchLoading(true);
+    setTspMatches([]);
     try {
-      const res = await fetch(process.env.NEXT_PUBLIC_API_URL + '/rules');
-      if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        setRules(data);
+      const input = searchValue.trim();
+      const isASN = /^(AS)?\d+$/i.test(input);
+      const query = isASN
+        ? `asn=${encodeURIComponent(input.toUpperCase().startsWith('AS') ? input.toUpperCase() : `AS${input}`)}`
+        : `tsp=${encodeURIComponent(input.toLowerCase())}`;
+
+      const res = await fetch(`${geoUrl}/lookup?${query}`);
+      if (res.status === 300) {
+        const data = await res.json(); // multiple matches
+        setTspMatches(data);
+        setError(null);
+      } else if (res.ok) {
+        const data = await res.json();
+        setAsn(data.asn || '');
+        setTsp(data.tsp || '');
+        setCountry(data.country || '');
+        setError(null);
       } else {
-        console.warn('Unexpected /rules response shape:', data);
-        setRules([]);
+        throw new Error('Not found');
       }
     } catch (err) {
-      console.error('Failed to fetch rules:', err);
-      setRules([]);
+      console.error('Search failed:', err);
+      setError('No match found for this input');
+    } finally {
+      setSearchLoading(false);
     }
   };
 
+  const handleSelectTSP = (match: any) => {
+    setAsn(match.asn);
+    setTsp(match.tsp);
+    setCountry(match.country || '');
+    setTspMatches([]);
+  };
+
+  // Submit Rule
   const submitRule = async () => {
     setError(null);
     setSuccess(false);
     try {
-      const res = await fetch(process.env.NEXT_PUBLIC_API_URL + '/rules', {
+      setLoading(true);
+      await fetch(`${apiUrl}/rules`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ asn, country, tsp, city, drop_percent: dropPercent, ttl }),
+        body: JSON.stringify({ asn, country, tsp, drop_percent: dropPercent, ttl, enabled: true }),
       });
-      if (!res.ok) throw new Error(await res.text());
-
       setSuccess(true);
-      setAsn('');
-      setCountry('');
-      setTsp('');
-      setCity('');
-      setDropPercent(0);
-      setTtl(0);
-      fetchRules();
-    } catch (err: any) {
-      setError(err.message || 'Failed to add rule');
+      setAsn(''); setCountry(''); setTsp(''); setDropPercent(0); setTtl(0); setSearchValue('');
+      reloadRules();
+    } catch (err) {
+      console.error("Rule submission failed:", err);
+      setError("Failed to submit rule");
+    } finally {
+      setLoading(false);
     }
   };
 
   const deleteRule = async (rule: Rule) => {
-    if (!rule.asn || !rule.country) {
-      alert('ASN and Country are required to delete a rule.');
-      return;
-    }
-
-    const query = new URLSearchParams({
-      asn: rule.asn,
-      country: rule.country,
-      tsp: rule.tsp || '',
-      city: rule.city || '',
-    });
-
-    try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/rules?${query.toString()}`, {
-        method: 'DELETE',
-      });
-
-      if (!res.ok) throw new Error(await res.text());
-      fetchRules();
-    } catch (err) {
-      console.error('Delete failed:', err);
-      alert('Failed to delete rule');
-    }
+    if (!confirm(`Delete rule ASN:${rule.asn}, Country:${rule.country}?`)) return;
+    const query = new URLSearchParams({ asn: rule.asn, country: rule.country, tsp: rule.tsp || '' });
+    await fetch(`${apiUrl}/rules?${query.toString()}`, { method: 'DELETE' });
+    reloadRules();
   };
 
-  useEffect(() => {
-    fetchRules();
-  }, []);
+  const toggleRuleEnabled = async (rule: Rule) => {
+    await fetch(`${apiUrl}/toggle-rule`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asn: rule.asn, country: rule.country, tsp: rule.tsp || "", enabled: !(rule.enabled ?? false) }),
+    });
+    reloadRules();
+  };
 
   return (
     <>
-      <Head>
-        <title>Alak Dashboard – Load Shedding Rules</title>
-      </Head>
-      <main style={{ padding: '2rem', fontFamily: 'system-ui, sans-serif' }}>
-        <h1>🎛️ Load Shedding Rules</h1>
+      <Head><title>Alak Dashboard – ASN/TSP Rules</title></Head>
+      <main style={{ padding: '2rem', fontFamily: 'system-ui, sans-serif', maxWidth: '800px', margin: '0 auto' }}>
+        <h1>🎛️ ASN/TSP Load Shedding Rules</h1>
 
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            submitRule();
-          }}
-          style={{ marginBottom: '1rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}
-        >
-          <input placeholder="ASN" value={asn} onChange={(e) => setAsn(e.target.value)} required />
-          <input placeholder="Country (e.g. IR)" value={country} onChange={(e) => setCountry(e.target.value)} required />
-          <input placeholder="TSP (e.g. irancell)" value={tsp} onChange={(e) => setTsp(e.target.value)} />
-          <input placeholder="City (e.g. tehran)" value={city} onChange={(e) => setCity(e.target.value)} />
-          <input
-            type="number"
-            placeholder="Drop %"
-            value={dropPercent}
-            onChange={(e) => setDropPercent(Number(e.target.value))}
-            min={0}
-            max={100}
-            style={{ width: '90px' }}
-          />
-          <input
-            type="number"
-            placeholder="TTL (s)"
-            value={ttl}
-            onChange={(e) => setTtl(Number(e.target.value))}
-            min={0}
-            style={{ width: '90px' }}
-          />
-          <button type="submit">➕ Add Rule</button>
+        {/* Single Search */}
+        <section style={{ border: '1px solid #ccc', padding: '1rem', marginBottom: '1rem', borderRadius: '6px' }}>
+          <label>
+            Enter ASN or TSP:
+            <input
+              value={searchValue}
+              onChange={(e) => setSearchValue(e.target.value)}
+              placeholder="e.g. AS44244 or irancell"
+              style={{ marginLeft: '0.5rem', width: '250px' }}
+            />
+          </label>
+          <button style={{ marginLeft: '0.5rem' }} onClick={handleSearch}>🔍 Search</button>
+          {searchLoading && <span style={{ marginLeft: '10px' }}>⏳ Searching...</span>}
+        </section>
+
+        {/* Multiple TSP Matches Dropdown */}
+        {tspMatches.length > 0 && (
+          <div style={{ border: '1px solid #aaa', padding: '0.5rem', marginBottom: '1rem' }}>
+            <p>Multiple matches found, select one:</p>
+            <ul style={{ listStyle: 'none', padding: 0 }}>
+              {tspMatches.map((match, i) => (
+                <li
+                  key={i}
+                  style={{ cursor: 'pointer', padding: '4px 0' }}
+                  onClick={() => handleSelectTSP(match)}
+                >
+                  {match.tsp} ({match.asn})
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Auto-filled fields */}
+        <section style={{ border: '1px solid #eee', padding: '1rem', marginBottom: '1rem' }}>
+          <label>ASN:<input value={asn} onChange={(e) => setAsn(e.target.value)} /></label><br /><br />
+          <label>TSP:<input value={tsp} onChange={(e) => setTsp(e.target.value)} /></label><br /><br />
+          <label>Country:<input value={country} onChange={(e) => setCountry(e.target.value)} /></label>
+        </section>
+
+        {/* Add Rule */}
+        <form onSubmit={(e) => { e.preventDefault(); submitRule(); }} style={{ display: 'grid', gap: '0.75rem', marginBottom: '1rem' }}>
+          <label>Drop %:<input type="number" value={dropPercent} onChange={(e) => setDropPercent(Number(e.target.value))} /></label>
+          <label>TTL (s):<input type="number" value={ttl} onChange={(e) => setTtl(Number(e.target.value))} /></label>
+          <button type="submit" disabled={loading}>{loading ? 'Adding...' : '➕ Add Rule'}</button>
         </form>
 
         {success && <p style={{ color: 'green' }}>✅ Rule added successfully</p>}
         {error && <p style={{ color: 'red' }}>❌ {error}</p>}
 
+        {/* Rules Table */}
         <h2>📋 Active Rules</h2>
-
-        {Array.isArray(rules) && rules.length === 0 ? (
+        {rulesError ? (
+          <p style={{ color: 'red' }}>Failed to load rules: {rulesError.message}</p>
+        ) : rules.length === 0 ? (
           <p style={{ color: '#888' }}>No rules configured yet.</p>
         ) : (
-          <table border={1} cellPadding={8} style={{ borderCollapse: 'collapse', width: '100%', marginTop: '1rem' }}>
+          <table border={1} cellPadding={8} style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr>
                 <th>ASN</th>
                 <th>Country</th>
                 <th>TSP</th>
-                <th>City</th>
                 <th>Drop %</th>
                 <th>TTL (s)</th>
+                <th>Enabled</th>
                 <th>Action</th>
               </tr>
             </thead>
@@ -157,12 +196,12 @@ export default function Home() {
                   <td>{rule.asn}</td>
                   <td>{rule.country}</td>
                   <td>{rule.tsp || '-'}</td>
-                  <td>{rule.city || '-'}</td>
                   <td>{rule.drop_percent}</td>
-                  <td>{rule.ttl ?? '-'}</td>
+                  <td>{rule.ttl !== undefined && rule.ttl >= 0 ? rule.ttl : '-'}</td>
                   <td>
-                    <button onClick={() => deleteRule(rule)}>🗑 Delete</button>
+                    <input type="checkbox" checked={rule.enabled !== false} onChange={() => toggleRuleEnabled(rule)} />
                   </td>
+                  <td><button onClick={() => deleteRule(rule)}>🗑 Delete</button></td>
                 </tr>
               ))}
             </tbody>

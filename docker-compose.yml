@@ -35,6 +35,7 @@ services:
     environment:
       - REDIS_HOST=alak-redis:6379
       - ALAK_URL=http://alak-geo:8081/lookup
+      - HA_PROXY_URL=http://haproxy:80
     depends_on:
       - alak-redis
 
@@ -46,5 +47,16 @@ services:
     restart: always
     environment:
       - NEXT_PUBLIC_API_URL=http://alak-controller:8080
+      - NEXT_PUBLIC_GEO_API_URL=http://alak-geo:8081
     depends_on:
       - alak-controller
+
+  haproxy:
+    image: haproxy:2.9
+    container_name: haproxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "8404:8404"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro

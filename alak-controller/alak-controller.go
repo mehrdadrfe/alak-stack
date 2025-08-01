@@ -3,162 +3,255 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Rule struct {
 	ASN         string `json:"asn"`
 	Country     string `json:"country"`
 	TSP         string `json:"tsp"`
-	City        string `json:"city"`
 	DropPercent int    `json:"drop_percent"`
-	TTL         int    `json:"ttl"` // in seconds, optional
+	TTL         int    `json:"ttl"`
+	Enabled     bool   `json:"enabled"`
+}
+
+type Meta struct {
+	ASN     string `json:"asn"`
+	Country string `json:"country"`
+	TSP     string `json:"tsp"`
+	City    string `json:"city"`
 }
 
 var (
-	rdb *redis.Client
-	ctx = context.Background()
+	ctx         = context.Background()
+	redisClient *redis.Client
+	geoURL      string
+	haProxyURL  string
+
+	requests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "alak_requests_total",
+			Help: "Total incoming requests by ASN, country, and TSP",
+		},
+		[]string{"asn", "country", "tsp"},
+	)
+	drops = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "alak_drops_total",
+			Help: "Total dropped requests by ASN, country, and TSP",
+		},
+		[]string{"asn", "country", "tsp"},
+	)
 )
 
+func init() {
+	prometheus.MustRegister(requests)
+	prometheus.MustRegister(drops)
+}
+
 func main() {
+	geoURL = os.Getenv("ALAK_GEO_URL")
+	if geoURL == "" {
+		geoURL = "http://alak-geo:8081/lookup"
+	}
+	haProxyURL = os.Getenv("HA_PROXY_URL")
+	if haProxyURL == "" {
+		haProxyURL = "http://haproxy:80"
+	}
+
 	redisHost := os.Getenv("REDIS_HOST")
 	if redisHost == "" {
 		redisHost = "localhost:6379"
 	}
-
-	rdb = redis.NewClient(&redis.Options{
+	redisClient = redis.NewClient(&redis.Options{
 		Addr: redisHost,
 	})
 
-	http.HandleFunc("/rules", corsMiddleware(rulesHandler))
-	http.HandleFunc("/tsp-list", corsMiddleware(tspListHandler))
+	http.HandleFunc("/", proxyHandler)
+	http.Handle("/metrics", promhttp.Handler())
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "8090"
 	}
-
-	log.Printf("Alak Controller listening on :%s...", port)
+	log.Printf("Alak Gatekeeper listening on :%s...", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// CORS middleware to allow cross-origin requests
-func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Allow all origins for dev; restrict in production
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	}
-}
-
-func rulesHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		keys, err := rdb.Keys(ctx, "rule:*").Result()
-		if err != nil {
-			http.Error(w, "Redis keys error", http.StatusInternalServerError)
-			return
-		}
-
-		var rules []Rule
-		for _, key := range keys {
-			val, err := rdb.Get(ctx, key).Result()
-			if err == nil {
-				var rule Rule
-				if json.Unmarshal([]byte(val), &rule) == nil {
-					rules = append(rules, rule)
-				}
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(rules)
-
-	case http.MethodPost:
-		var rule Rule
-		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		// Normalize fields
-		rule.Country = strings.ToUpper(rule.Country)
-		rule.City = strings.ToLower(rule.City)
-		rule.TSP = strings.ToLower(rule.TSP)
-
-		key := "rule:" + rule.ASN + ":" + rule.Country + ":" + rule.TSP + ":" + rule.City
-
-		data, _ := json.Marshal(rule)
-		ttl := time.Duration(rule.TTL) * time.Second
-		if err := rdb.Set(ctx, key, data, ttl).Err(); err != nil {
-			http.Error(w, "Redis write error", http.StatusInternalServerError)
-			return
-		}
-
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte("Rule stored\n"))
-
-	case http.MethodDelete:
-		asn := r.URL.Query().Get("asn")
-		country := r.URL.Query().Get("country")
-		tsp := r.URL.Query().Get("tsp")
-		city := r.URL.Query().Get("city")
-
-		if asn == "" || country == "" {
-			http.Error(w, "asn and country required", http.StatusBadRequest)
-			return
-		}
-
-		country = strings.ToUpper(country)
-		tsp = strings.ToLower(tsp)
-		city = strings.ToLower(city)
-
-		key := "rule:" + asn + ":" + country + ":" + tsp + ":" + city
-		rdb.Del(ctx, key)
-		w.Write([]byte("Rule deleted\n"))
-
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func tspListHandler(w http.ResponseWriter, r *http.Request) {
-	keys, err := rdb.Keys(ctx, "rule:*").Result()
-	if err != nil {
-		http.Error(w, "Redis error", http.StatusInternalServerError)
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		http.Error(w, "Missing X-Forwarded-For header", http.StatusBadRequest)
 		return
 	}
 
-	tspSet := make(map[string]struct{})
+	lookupURL := fmt.Sprintf("%s?ip=%s", geoURL, ip)
+	resp, err := http.Get(lookupURL)
+	if err != nil {
+		log.Printf("[FAIL-OPEN] GeoIP lookup error for IP %s: %v; allowing request", ip, err)
+		proxyToHAProxy(w, r, ip)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		log.Printf("[PASS] No GeoIP data for IP %s", ip)
+		proxyToHAProxy(w, r, ip)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[FAIL-OPEN] GeoIP lookup failed for IP %s: status %d; allowing request", ip, resp.StatusCode)
+		proxyToHAProxy(w, r, ip)
+		return
+	}
+
+	var meta Meta
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		log.Printf("[FAIL-OPEN] Failed to decode GeoIP response for IP %s: %v; allowing request", ip, err)
+		proxyToHAProxy(w, r, ip)
+		return
+	}
+
+	if meta.ASN == "" || meta.Country == "" {
+		log.Printf("[PASS] Incomplete GeoIP data for IP %s", ip)
+		proxyToHAProxy(w, r, ip)
+		return
+	}
+
+	labels := prometheus.Labels{
+		"asn":     meta.ASN,
+		"country": meta.Country,
+		"tsp":     meta.TSP,
+	}
+	requests.With(labels).Inc()
+
+	keys := buildRuleKeys(meta)
+
+	var rule Rule
+	found := false
 	for _, key := range keys {
-		parts := strings.Split(key, ":")
-		if len(parts) >= 4 {
-			tsp := parts[3]
-			if tsp != "" {
-				tspSet[tsp] = struct{}{}
-			}
+		val, err := redisClient.Get(ctx, key).Result()
+		if err == redis.Nil {
+			continue
+		} else if err != nil {
+			log.Printf("[FAIL-OPEN] Redis get error: %v; allowing request", err)
+			proxyToHAProxy(w, r, ip)
+			return
+		}
+		if err := json.Unmarshal([]byte(val), &rule); err != nil {
+			log.Printf("[FAIL-OPEN] Failed to unmarshal rule at %s: %v; allowing request", key, err)
+			proxyToHAProxy(w, r, ip)
+			return
+		}
+		found = true
+		break
+	}
+
+	if !found {
+		log.Printf("[PASS] No matching rule for %s", meta.ASN)
+		proxyToHAProxy(w, r, ip)
+		return
+	}
+
+	if !rule.Enabled {
+		log.Printf("[PASS] Rule disabled for %s", meta.ASN)
+		proxyToHAProxy(w, r, ip)
+		return
+	}
+
+	hash := hashIP(ip)
+	log.Printf("[RULE MATCH] IP=%s ASN=%s Country=%s TSP=%s Drop%%=%d Enabled=%v Hash=%d",
+		ip, rule.ASN, rule.Country, rule.TSP, rule.DropPercent, rule.Enabled, hash)
+
+	if hash < rule.DropPercent {
+		drops.With(labels).Inc()
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("Request blocked by Alak Gatekeeper\n"))
+		return
+	}
+
+	log.Printf("[PASS] Request allowed for IP %s", ip)
+	proxyToHAProxy(w, r, ip)
+}
+
+// Helper to build rule keys (business logic unchanged)
+func buildRuleKeys(meta Meta) []string {
+	var keys []string
+	asnSet := meta.ASN != "" && meta.TSP != ""
+	countrySet := meta.Country != ""
+
+	if asnSet {
+		if countrySet {
+			keys = append(keys, fmt.Sprintf("rule:%s:%s:%s", meta.ASN, meta.Country, meta.TSP))
+			keys = append(keys, fmt.Sprintf("rule:%s:%s:*", meta.ASN, meta.Country))
+			keys = append(keys, fmt.Sprintf("rule:%s:*:%s", meta.ASN, meta.TSP))
+			keys = append(keys, fmt.Sprintf("rule:%s:*:*", meta.ASN))
+		} else {
+			keys = append(keys, fmt.Sprintf("rule:%s:*:%s", meta.ASN, meta.TSP))
+			keys = append(keys, fmt.Sprintf("rule:%s:*:*", meta.ASN))
 		}
 	}
+	if countrySet {
+		keys = append(keys, fmt.Sprintf("rule:*:%s:*", meta.Country))
+	}
+	keys = append(keys, "rule:*:*:*")
+	return keys
+}
 
-	var tsps []string
-	for tsp := range tspSet {
-		tsps = append(tsps, tsp)
+func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
+	proxyURL := haProxyURL + r.URL.RequestURI()
+
+	req, err := http.NewRequest(r.Method, proxyURL, r.Body)
+	if err != nil {
+		log.Printf("[PROXY ERROR] newRequest: %v", err)
+		http.Error(w, "Proxy error", http.StatusInternalServerError)
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tsps)
+	for h, vals := range r.Header {
+		if strings.ToLower(h) == "host" {
+			continue
+		}
+		for _, v := range vals {
+			req.Header.Add(h, v)
+		}
+	}
+	existing := r.Header.Get("X-Forwarded-For")
+	if existing != "" && !strings.Contains(existing, clientIP) {
+		req.Header.Set("X-Forwarded-For", existing+", "+clientIP)
+	} else if existing == "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[PROXY ERROR] client.Do: %v", err)
+		http.Error(w, "Upstream HAProxy error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vals := range resp.Header {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = http.MaxBytesReader(w, resp.Body, 10<<20).WriteTo(w)
+}
+
+func hashIP(ip string) int {
+	h := fnv.New32a()
+	h.Write([]byte(ip))
+	return int(h.Sum32() % 100)
 }
