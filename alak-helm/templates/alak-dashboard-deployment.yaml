@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alak-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alak-dashboard
+  template:
+    metadata:
+      labels:
+        app: alak-dashboard
+    spec:
+      containers:
+        - name: alak-dashboard
+          image: {{ .Values.alakDashboard.image }}
+          ports:
+            - containerPort: {{ .Values.alakDashboard.port }}
+          env:
+            {{- range $k, $v := .Values.alakDashboard.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alak-dashboard
+spec:
+  selector:
+    app: alak-dashboard
+  ports:
+    - port: {{ .Values.alakDashboard.port }}
+      targetPort: {{ .Values.alakDashboard.port }}

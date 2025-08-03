@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alak-gatekeeper
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alak-gatekeeper
+  template:
+    metadata:
+      labels:
+        app: alak-gatekeeper
+    spec:
+      containers:
+        - name: alak-gatekeeper
+          image: {{ .Values.alakGatekeeper.image }}
+          ports:
+            - containerPort: {{ .Values.alakGatekeeper.port }}
+          env:
+            {{- range $k, $v := .Values.alakGatekeeper.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.alakGatekeeper.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ .Values.alakGatekeeper.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alak-gatekeeper
+spec:
+  selector:
+    app: alak-gatekeeper
+  ports:
+    - port: {{ .Values.alakGatekeeper.port }}
+      targetPort: {{ .Values.alakGatekeeper.port }}

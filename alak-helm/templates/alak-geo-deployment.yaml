@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alak-geo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alak-geo
+  template:
+    metadata:
+      labels:
+        app: alak-geo
+    spec:
+      containers:
+        - name: alak-geo
+          image: {{ .Values.alakGeo.image }}
+          ports:
+            - containerPort: {{ .Values.alakGeo.port }}
+          env:
+            {{- range $k, $v := .Values.alakGeo.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+          volumeMounts:
+            - name: geoip-volume
+              mountPath: /data
+      volumes:
+        - name: geoip-volume
+          emptyDir: {} # Replace with PersistentVolume if needed
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alak-geo
+spec:
+  selector:
+    app: alak-geo
+  ports:
+    - port: {{ .Values.alakGeo.port }}
+      targetPort: {{ .Values.alakGeo.port }}

@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alak-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alak-controller
+  template:
+    metadata:
+      labels:
+        app: alak-controller
+    spec:
+      containers:
+        - name: alak-controller
+          image: {{ .Values.alakController.image }}
+          ports:
+            - containerPort: {{ .Values.alakController.port }}
+          env:
+            {{- range $k, $v := .Values.alakController.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alak-controller
+spec:
+  selector:
+    app: alak-controller
+  ports:
+    - port: {{ .Values.alakController.port }}
+      targetPort: {{ .Values.alakController.port }}

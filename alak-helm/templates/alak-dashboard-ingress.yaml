@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alak-dashboard
+spec:
+  rules:
+    - host: dashboard.yourdomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: alak-dashboard
+                port:
+                  number: {{ .Values.alakDashboard.port }}

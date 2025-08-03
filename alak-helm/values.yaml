@@ -1,0 +1,25 @@
+alakGatekeeper:
+  image: yourrepo/alak-gatekeeper:latest
+  port: 8090
+  env:
+    REDIS_HOST: redis:6379
+    ALAK_GEO_URL: http://alak-geo:8081/lookup
+    HA_PROXY_URL: http://haproxy:80
+
+alakGeo:
+  image: yourrepo/alak-geo:latest
+  port: 8081
+  env: {}
+
+alakController:
+  image: yourrepo/alak-controller:latest
+  port: 8080
+  env:
+    REDIS_HOST: redis:6379
+
+alakDashboard:
+  image: yourrepo/alak-dashboard:latest
+  port: 3000
+  env:
+    NEXT_PUBLIC_API_URL: http://alak-controller:8080
+    NEXT_PUBLIC_GEO_API_URL: http://alak-geo:8081
