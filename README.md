@@ -108,11 +108,3 @@ Or reach out to your team or maintainer!
 
 Built with ❤️ for modern edge and traffic management.
 
-
----
-
-**This file is ready to use.  
-Update links, project names, or add badges as you wish.**
-
-If you want further customization, badges, or a demo GIF, just ask!
-
