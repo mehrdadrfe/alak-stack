@@ -23,9 +23,9 @@ flowchart LR
     gk --> geo
     gk --> redis
     dashboard --> controller
+    dashboard --> geo
     admin --> dashboard
     controller --> redis
-    geo --> controller
 ```
 
 - **HAProxy**: Edge proxy/load balancer.
@@ -56,8 +56,6 @@ flowchart LR
 alak-stack/
 ├── docker-compose.yml
 ├── haproxy.cfg
-├── docs/
-│   └── architecture.png
 ├── alak-gatekeeper/
 │   ├── main.go, go.mod, go.sum, Dockerfile
 ├── alak-geo/
