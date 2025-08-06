@@ -119,7 +119,7 @@ export default function Home() {
     <>
       <Head><title>Alak Dashboard – ASN/TSP Rules</title></Head>
       <main style={{ padding: '2rem', fontFamily: 'system-ui, sans-serif', maxWidth: '800px', margin: '0 auto' }}>
-        <h1>🎛️ ASN/TSP Load Shedding Rules</h1>
+        <h1>🎛️ Alak Load Shedding Rules</h1>
 
         {/* Single Search */}
         <section style={{ border: '1px solid #ccc', padding: '1rem', marginBottom: '1rem', borderRadius: '6px' }}>
