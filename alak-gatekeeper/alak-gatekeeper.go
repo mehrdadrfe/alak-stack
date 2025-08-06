@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -35,7 +36,6 @@ type Meta struct {
 	City    string `json:"city"`
 }
 
-// Normalization: trim, treat "-" as empty, uppercase country.
 func cleanField(s string, isCountry bool) string {
 	s = strings.TrimSpace(s)
 	if s == "-" {
@@ -52,6 +52,7 @@ var (
 	redisClient *redis.Client
 	geoURL      string
 	haProxyURL  string
+	proxyClient *http.Client
 
 	requests = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -75,7 +76,6 @@ func init() {
 }
 
 func main() {
-	// GeoIP service URL
 	geoURL = os.Getenv("ALAK_GEO_URL")
 	if geoURL == "" {
 		geoURL = "http://alak-geo:8081/lookup"
@@ -85,7 +85,6 @@ func main() {
 		haProxyURL = "http://haproxy:80"
 	}
 
-	// Redis setup
 	redisHost := os.Getenv("REDIS_HOST")
 	if redisHost == "" {
 		redisHost = "localhost:6379"
@@ -93,6 +92,22 @@ func main() {
 	redisClient = redis.NewClient(&redis.Options{
 		Addr: redisHost,
 	})
+
+	// Conditionally set InsecureSkipVerify
+	skipTLSVerify := os.Getenv("SKIP_TLS_VERIFY")
+	if strings.ToLower(skipTLSVerify) == "true" {
+		log.Printf("⚠️  SKIP_TLS_VERIFY is enabled! TLS cert validation will be skipped for backend proxy connections.")
+		proxyClient = &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+	} else {
+		proxyClient = &http.Client{
+			Timeout: 5 * time.Second,
+		}
+	}
 
 	http.HandleFunc("/", proxyHandler)
 	http.Handle("/metrics", promhttp.Handler())
@@ -125,13 +140,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// 404 → no data → pass
 	if resp.StatusCode == http.StatusNotFound {
 		log.Printf("[PASS] No GeoIP data for IP %s", ip)
 		proxyToHAProxy(w, r, ip)
 		return
 	}
-	// other non-200 → error, fail open
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[FAIL-OPEN] GeoIP lookup failed for IP %s: status %d; allowing request", ip, resp.StatusCode)
 		proxyToHAProxy(w, r, ip)
@@ -145,7 +158,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Normalize fields
 	meta.ASN = cleanField(meta.ASN, false)
 	meta.Country = cleanField(meta.Country, true)
 	meta.TSP = cleanField(meta.TSP, false)
@@ -157,7 +169,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	requests.With(labels).Inc()
 
-	// Build rule keys by your business invariant and with normalization
 	ruleKeys := buildRuleKeys(meta)
 	log.Printf("[DEBUG] IP=%s ASN=%q Country=%q TSP=%q; Keys checked: %v", ip, meta.ASN, meta.Country, meta.TSP, ruleKeys)
 
@@ -212,13 +223,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	proxyToHAProxy(w, r, ip)
 }
 
-// Only build keys that can exist given the ASN+TSP always-present invariant, with normalization
 func buildRuleKeys(meta Meta) []string {
 	var keys []string
 	asnSet := meta.ASN != "" && meta.TSP != ""
 	countrySet := meta.Country != ""
 
-	// ASN+TSP present
 	if asnSet {
 		if countrySet {
 			keys = append(keys, fmt.Sprintf("rule:%s:%s:%s", meta.ASN, meta.Country, meta.TSP))
@@ -230,11 +239,9 @@ func buildRuleKeys(meta Meta) []string {
 			keys = append(keys, fmt.Sprintf("rule:%s:*:*", meta.ASN))
 		}
 	}
-	// ASN/TSP missing, country present
 	if !asnSet && countrySet {
 		keys = append(keys, fmt.Sprintf("rule:*:%s:*", meta.Country))
 	}
-	// Global catch-all
 	keys = append(keys, "rule:*:*:*")
 	return keys
 }
@@ -255,10 +262,8 @@ func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
 			req.Header.Add(h, v)
 		}
 	}
-	// **Set Host header to preserve original host for HAProxy/backend routing**
 	req.Host = r.Host
 
-	// Set or append X-Forwarded-For
 	existing := r.Header.Get("X-Forwarded-For")
 	if existing != "" && !strings.Contains(existing, clientIP) {
 		req.Header.Set("X-Forwarded-For", existing+", "+clientIP)
@@ -266,8 +271,7 @@ func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
 		req.Header.Set("X-Forwarded-For", clientIP)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := proxyClient.Do(req)
 	if err != nil {
 		log.Printf("[PROXY ERROR] client.Do: %v", err)
 		http.Error(w, "Upstream HAProxy error", http.StatusBadGateway)
@@ -275,7 +279,6 @@ func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
 	}
 	defer resp.Body.Close()
 
-	// Copy headers from HAProxy response
 	for k, vals := range resp.Header {
 		for _, v := range vals {
 			w.Header().Add(k, v)
