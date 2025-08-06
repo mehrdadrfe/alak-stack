@@ -249,15 +249,14 @@ func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
 		return
 	}
 
-	// Copy all headers except Host (handled by Go)
+	// Copy all headers
 	for h, vals := range r.Header {
-		if strings.ToLower(h) == "host" {
-			continue
-		}
 		for _, v := range vals {
 			req.Header.Add(h, v)
 		}
 	}
+	// **Set Host header to preserve original host for HAProxy/backend routing**
+	req.Host = r.Host
 
 	// Set or append X-Forwarded-For
 	existing := r.Header.Get("X-Forwarded-For")
