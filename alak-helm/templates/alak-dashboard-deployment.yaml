@@ -18,10 +18,16 @@ spec:
           ports:
             - containerPort: {{ .Values.alakDashboard.port }}
           env:
-            {{- range $k, $v := .Values.alakDashboard.env }}
-            - name: {{ $k }}
-              value: "{{ $v }}"
-            {{- end }}
+            - name: NEXT_PUBLIC_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: NEXT_PUBLIC_API_URL
+            - name: NEXT_PUBLIC_GEO_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: NEXT_PUBLIC_GEO_API_URL
 ---
 apiVersion: v1
 kind: Service

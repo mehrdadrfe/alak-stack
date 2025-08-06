@@ -1,10 +1,16 @@
+{{- if .Values.alakDashboard.ingress.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: alak-dashboard
 spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - {{ .Values.alakDashboard.ingress.host | quote }}
+      secretName: {{ .Values.alakDashboard.ingress.tlsSecret | quote }}
   rules:
-    - host: dashboard.yourdomain.com
+    - host: {{ .Values.alakDashboard.ingress.host | quote }}
       http:
         paths:
           - path: /
@@ -14,3 +20,4 @@ spec:
                 name: alak-dashboard
                 port:
                   number: {{ .Values.alakDashboard.port }}
+{{- end }}

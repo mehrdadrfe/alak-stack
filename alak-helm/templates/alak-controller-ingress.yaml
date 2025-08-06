@@ -1,0 +1,23 @@
+{{- if .Values.alakController.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alak-controller
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - {{ .Values.alakController.ingress.host | quote }}
+      secretName: {{ .Values.alakController.ingress.tlsSecret | quote }}
+  rules:
+    - host: {{ .Values.alakController.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: alak-controller
+                port:
+                  number: {{ .Values.alakController.port }}
+{{- end }}

@@ -1,25 +1,42 @@
 alakGatekeeper:
-  image: yourrepo/alak-gatekeeper:latest
+  image: dockerrepo/alak-stack-alak-gatekeeper:latest
   port: 8090
   env:
-    REDIS_HOST: redis:6379
+    REDIS_HOST: alak-redis-master:6379
     ALAK_GEO_URL: http://alak-geo:8081/lookup
-    HA_PROXY_URL: http://haproxy:80
-
-alakGeo:
-  image: yourrepo/alak-geo:latest
-  port: 8081
-  env: {}
+    HA_PROXY_URL: https://ingress-nginx-controller.ingress-nginx
+    SKIP_TLS_VERIFY: "true"
 
 alakController:
-  image: yourrepo/alak-controller:latest
+  image: dockerrepo/alak-stack-alak-controller:latest
   port: 8080
   env:
-    REDIS_HOST: redis:6379
+    REDIS_HOST: alak-redis-master:6379
+  ingress:
+    enabled: true
+    host: alak-controller.example.com
+    tlsSecret: example-tls-secret
+
+alakGeo:
+  image: dockerrepo/alak-stack-alak-geo:latest
+  port: 8081
+  env: {}
+  storage:
+    size: 1Gi
+    accessModes: [ReadWriteOnce]
+    storageClassName: ""
+  ingress:
+    enabled: true
+    host: alak-geo.example.com
+    tlsSecret: example-tls-secret
 
 alakDashboard:
-  image: yourrepo/alak-dashboard:latest
+  image: dockerrepo/alak-stack-alak-dashboard:latest
   port: 3000
   env:
-    NEXT_PUBLIC_API_URL: http://alak-controller:8080
-    NEXT_PUBLIC_GEO_API_URL: http://alak-geo:8081
+    NEXT_PUBLIC_API_URL: https://alak-controller.example.com/
+    NEXT_PUBLIC_GEO_API_URL: https://alak-geo.example.com/
+  ingress:
+    enabled: true
+    host: alak-dashboard.example.com
+    tlsSecret: example-tls-secret

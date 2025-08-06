@@ -1,0 +1,23 @@
+{{- if .Values.alakGeo.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alak-geo
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - {{ .Values.alakGeo.ingress.host | quote }}
+      secretName: {{ .Values.alakGeo.ingress.tlsSecret | quote }}
+  rules:
+    - host: {{ .Values.alakGeo.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: alak-geo
+                port:
+                  number: {{ .Values.alakGeo.port }}
+{{- end }}

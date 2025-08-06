@@ -23,11 +23,12 @@ spec:
               value: "{{ $v }}"
             {{- end }}
           volumeMounts:
-            - name: geoip-volume
+            - name: geo-data
               mountPath: /data
       volumes:
-        - name: geoip-volume
-          emptyDir: {} # Replace with PersistentVolume if needed
+        - name: geo-data
+          persistentVolumeClaim:
+            claimName: alak-geo-data
 ---
 apiVersion: v1
 kind: Service
@@ -39,3 +40,17 @@ spec:
   ports:
     - port: {{ .Values.alakGeo.port }}
       targetPort: {{ .Values.alakGeo.port }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alak-geo-data
+spec:
+  accessModes:
+    {{- toYaml .Values.alakGeo.storage.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.alakGeo.storage.size }}
+  {{- if .Values.alakGeo.storage.storageClassName }}
+  storageClassName: {{ .Values.alakGeo.storage.storageClassName }}
+  {{- end }}

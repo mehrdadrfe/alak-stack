@@ -18,22 +18,26 @@ spec:
           ports:
             - containerPort: {{ .Values.alakGatekeeper.port }}
           env:
-            {{- range $k, $v := .Values.alakGatekeeper.env }}
-            - name: {{ $k }}
-              value: "{{ $v }}"
-            {{- end }}
-          readinessProbe:
-            httpGet:
-              path: /
-              port: {{ .Values.alakGatekeeper.port }}
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /metrics
-              port: {{ .Values.alakGatekeeper.port }}
-            initialDelaySeconds: 10
-            periodSeconds: 20
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: REDIS_HOST
+            - name: ALAK_GEO_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: ALAK_GEO_URL
+            - name: HA_PROXY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: HA_PROXY_URL
+            - name: SKIP_TLS_VERIFY
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: SKIP_TLS_VERIFY
 ---
 apiVersion: v1
 kind: Service

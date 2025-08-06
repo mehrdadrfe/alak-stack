@@ -18,10 +18,11 @@ spec:
           ports:
             - containerPort: {{ .Values.alakController.port }}
           env:
-            {{- range $k, $v := .Values.alakController.env }}
-            - name: {{ $k }}
-              value: "{{ $v }}"
-            {{- end }}
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: REDIS_HOST
 ---
 apiVersion: v1
 kind: Service
