@@ -1,0 +1,20 @@
+{{- if .Values.alakGatekeeper.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: alak-gatekeeper
+  labels:
+    {{- toYaml .Values.alakGatekeeper.serviceMonitor.labels | nindent 4 }}
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: alak-gatekeeper
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http  # or "metrics" if you add a second port
+      path: {{ .Values.alakGatekeeper.serviceMonitor.path }}
+      interval: {{ .Values.alakGatekeeper.serviceMonitor.interval }}
+{{- end }}

@@ -47,5 +47,6 @@ spec:
   selector:
     app: alak-gatekeeper
   ports:
-    - port: {{ .Values.alakGatekeeper.port }}
+    - name: http
+      port: {{ .Values.alakGatekeeper.port }}
       targetPort: {{ .Values.alakGatekeeper.port }}
