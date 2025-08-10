@@ -68,7 +68,13 @@ var (
 		},
 		[]string{"asn", "country", "tsp"},
 	)
+
+	// Optional override to force SNI to a specific hostname (e.g., api.foodstg.com) for debugging
+	sniOverride = getenv("ALAK_SNI_OVERRIDE", "")
 )
+
+// ctx key to pass SNI (servername) into DialTLSContext
+type sniCtxKey struct{}
 
 func init() {
 	prometheus.MustRegister(requests)
@@ -76,47 +82,25 @@ func init() {
 }
 
 func main() {
-	geoURL = os.Getenv("ALAK_GEO_URL")
-	if geoURL == "" {
-		geoURL = "http://alak-geo:8081/lookup"
-	}
-	haProxyURL = os.Getenv("HA_PROXY_URL")
-	if haProxyURL == "" {
-		haProxyURL = "http://haproxy:80"
+	geoURL = getenv("ALAK_GEO_URL", "http://alak-geo:8081/lookup")
+	haProxyURL = getenv("HA_PROXY_URL", "http://haproxy:80")
+
+	redisHost := getenv("REDIS_HOST", "localhost:6379")
+	redisClient = redis.NewClient(&redis.Options{Addr: redisHost})
+
+	skipTLSVerify := strings.EqualFold(getenv("SKIP_TLS_VERIFY", "true"), "true")
+	if skipTLSVerify {
+		log.Printf("⚠️  SKIP_TLS_VERIFY=true — backend TLS certificate verification is disabled.")
 	}
 
-	redisHost := os.Getenv("REDIS_HOST")
-	if redisHost == "" {
-		redisHost = "localhost:6379"
-	}
-	redisClient = redis.NewClient(&redis.Options{
-		Addr: redisHost,
-	})
-
-	// Conditionally set InsecureSkipVerify
-	skipTLSVerify := os.Getenv("SKIP_TLS_VERIFY")
-	if strings.ToLower(skipTLSVerify) == "true" {
-		log.Printf("⚠️  SKIP_TLS_VERIFY is enabled! TLS cert validation will be skipped for backend proxy connections.")
-		proxyClient = &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
-	} else {
-		proxyClient = &http.Client{
-			Timeout: 5 * time.Second,
-		}
-	}
+	proxyClient = newProxyClient(skipTLSVerify)
 
 	http.HandleFunc("/", proxyHandler)
 	http.Handle("/metrics", promhttp.Handler())
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8090"
-	}
-	log.Printf("Alak Gatekeeper listening on :%s...", port)
+	port := getenv("PORT", "8090")
+	log.Printf("Alak Gatekeeper listening on :%s (upstream=%s, geo=%s, skip_verify=%v, sni_override=%q)",
+		port, haProxyURL, geoURL, skipTLSVerify, sniOverride)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
@@ -215,7 +199,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if hash < rule.DropPercent {
 		drops.With(labels).Inc()
 		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte("Request blocked by Alak Gatekeeper\n"))
+		_, _ = w.Write([]byte("Request blocked by Alak Gatekeeper\n"))
 		return
 	}
 
@@ -247,23 +231,42 @@ func buildRuleKeys(meta Meta) []string {
 }
 
 func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
-	proxyURL := haProxyURL + r.URL.RequestURI()
+	// Build upstream URL by concatenating base (scheme+host[:port]) with the original path + query
+	upURL := haProxyURL + r.URL.RequestURI()
 
-	req, err := http.NewRequest(r.Method, proxyURL, r.Body)
+	req, err := http.NewRequest(r.Method, upURL, r.Body)
 	if err != nil {
-		log.Printf("[PROXY ERROR] newRequest: %v", err)
+		log.Printf("[PROXY ERROR] newRequest(%s): %v", upURL, err)
 		http.Error(w, "Proxy error", http.StatusInternalServerError)
 		return
 	}
 
-	// Copy all headers
+	// Copy all headers as-is
 	for h, vals := range r.Header {
 		for _, v := range vals {
 			req.Header.Add(h, v)
 		}
 	}
-	req.Host = r.Host
 
+	// Determine clean host for Ingress routing & SNI (no :port)
+	cleanHost := hostNoPort(r.Host)
+	if sniOverride != "" {
+		cleanHost = sniOverride
+	}
+
+	// Preserve Host for Ingress host-based routing
+	req.Host = cleanHost
+	req.Header.Set("Host", cleanHost)
+
+	// Forward proto/host hints
+	if r.TLS != nil {
+		req.Header.Set("X-Forwarded-Proto", "https")
+	} else {
+		req.Header.Set("X-Forwarded-Proto", "http")
+	}
+	req.Header.Set("X-Forwarded-Host", cleanHost)
+
+	// XFF chain
 	existing := r.Header.Get("X-Forwarded-For")
 	if existing != "" && !strings.Contains(existing, clientIP) {
 		req.Header.Set("X-Forwarded-For", existing+", "+clientIP)
@@ -271,25 +274,114 @@ func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
 		req.Header.Set("X-Forwarded-For", clientIP)
 	}
 
+	// Use a fresh, bounded context so upstream isn’t killed by client jitter
+	ctxUp, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ctxUp = context.WithValue(ctxUp, sniCtxKey{}, cleanHost)
+	req = req.WithContext(ctxUp)
+
+	log.Printf("[PROXY → INGRESS] url=%s host=%q sni=%q method=%s", upURL, cleanHost, cleanHost, r.Method)
+
 	resp, err := proxyClient.Do(req)
 	if err != nil {
-		log.Printf("[PROXY ERROR] client.Do: %v", err)
+		log.Printf("[PROXY ERROR] client.Do url=%s host=%q sni=%q: %v", upURL, cleanHost, cleanHost, err)
 		http.Error(w, "Upstream HAProxy error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	// Copy response headers
 	for k, vals := range resp.Header {
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}
 	}
+
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func hashIP(ip string) int {
 	h := fnv.New32a()
-	h.Write([]byte(ip))
+	_, _ = h.Write([]byte(ip))
 	return int(h.Sum32() % 100)
+}
+
+func getenv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func hostNoPort(h string) string {
+	if h == "" {
+		return h
+	}
+	if nh, _, err := net.SplitHostPort(h); err == nil && nh != "" {
+		return nh
+	}
+	return h
+}
+
+// --- HTTP client with per-request SNI injection, h2 disabled, and no redirect follow ---
+
+func newProxyClient(skipVerify bool) *http.Client {
+	baseTLS := &tls.Config{
+		InsecureSkipVerify: skipVerify,           // set to false once CA is mounted
+		NextProtos:         []string{"http/1.1"}, // advertise h1 only
+		MinVersion:         tls.VersionTLS12,
+	}
+
+	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 60 * time.Second}
+
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     false,                                                  // disable h2 to avoid cancel-on-upgrade quirks
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // no h2
+		MaxIdleConns:          512,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 2 * time.Second,
+	}
+
+	// Inject SNI (servername) from request context, then do TLS handshake
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		serverName := ""
+		if v := ctx.Value(sniCtxKey{}); v != nil {
+			if s, ok := v.(string); ok {
+				serverName = s
+			}
+		}
+		if serverName == "" {
+			if host, _, _ := net.SplitHostPort(addr); host != "" {
+				serverName = host
+			}
+		}
+
+		cfg := baseTLS.Clone()
+		cfg.ServerName = serverName
+
+		tlsConn := tls.Client(raw, cfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("tls handshake to %s with SNI=%q failed: %w", addr, serverName, err)
+		}
+		return tlsConn, nil
+	}
+
+	return &http.Client{
+		Transport: tr,
+		Timeout:   25 * time.Second,
+		// Critical for browser-driven auth flows: do NOT follow upstream redirects.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
