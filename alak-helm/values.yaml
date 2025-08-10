@@ -6,7 +6,13 @@ alakGatekeeper:
     ALAK_GEO_URL: http://alak-geo:8081/lookup
     HA_PROXY_URL: https://ingress-nginx-controller.ingress-nginx
     SKIP_TLS_VERIFY: "true"
-
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    path: /metrics
+    labels:
+      release: prometheus
+      
 alakController:
   image: dockerrepo/alak-stack-alak-controller:latest
   port: 8080
