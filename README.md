@@ -108,12 +108,12 @@ docker compose up -d --build
 You can deploy the stack (or just Gatekeeper) via the bundled Helm chart.
 
 ### Install
-From the repo root (assuming chart lives at charts/alak-stack/):
+From the repo root:
 ```bash
 kubectl create ns alak || true
 helm upgrade --install alak charts/alak-stack \
   -n alak \
-  -f values-stage.yaml
+  -f charts/values-stage.yaml
 ```
 > Keep separate values per environment, e.g. values-stage.yaml, values-prod.yaml.
 ---
