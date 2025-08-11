@@ -69,7 +69,6 @@ var (
 		[]string{"asn", "country", "tsp"},
 	)
 
-	// Optional override to force SNI to a specific hostname (e.g., api.foodstg.com) for debugging
 	sniOverride = getenv("ALAK_SNI_OVERRIDE", "")
 )
 

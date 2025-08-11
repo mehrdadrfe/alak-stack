@@ -1,5 +1,5 @@
 alakGatekeeper:
-  image: dockerrepo/alak-stack-alak-gatekeeper:latest
+  image: exdockerrepo/alak-stack-alak-gatekeeper:latest
   port: 8090
   env:
     REDIS_HOST: alak-redis-master:6379
@@ -12,19 +12,37 @@ alakGatekeeper:
     path: /metrics
     labels:
       release: prometheus
-      
+
 alakController:
-  image: dockerrepo/alak-stack-alak-controller:latest
+  image: exdockerrepo/alak-stack-alak-controller:latest
+  imagePullPolicy: IfNotPresent
+  serviceType: ClusterIP
+  servicePort: 8080
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
   port: 8080
+  extraEnv: []
+  podAnnotations: {}
   env:
     REDIS_HOST: alak-redis-master:6379
+    CORS_ORIGINS: https://alak-dashboard.example.com
   ingress:
     enabled: true
     host: alak-controller.example.com
     tlsSecret: example-tls-secret
+    annotations:
+      kubernetes.io/ingress.class: "nginx"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "60s"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "60s"
 
 alakGeo:
-  image: dockerrepo/alak-stack-alak-geo:latest
+  image: exdockerrepo/alak-stack-alak-geo:latest
   port: 8081
   env: {}
   storage:
@@ -37,11 +55,19 @@ alakGeo:
     tlsSecret: example-tls-secret
 
 alakDashboard:
-  image: dockerrepo/alak-stack-alak-dashboard:latest
+  image: exdockerrepo/alak-stack-alak-dashboard:1.1
   port: 3000
+  replicas: 1
   env:
-    NEXT_PUBLIC_API_URL: https://alak-controller.example.com/
-    NEXT_PUBLIC_GEO_API_URL: https://alak-geo.example.com/
+    CONTROLLER_ORIGIN: http://alak-controller:8080
+    GEO_ORIGIN: http://alak-geo:8081
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
   ingress:
     enabled: true
     host: alak-dashboard.example.com

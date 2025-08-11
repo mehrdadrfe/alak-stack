@@ -14,6 +14,7 @@ services:
     restart: always
     environment:
       - REDIS_HOST=alak-redis:6379
+      - CORS_ORIGINS=http://localhost:3000
     depends_on:
       - alak-redis
 
@@ -34,8 +35,9 @@ services:
     restart: always
     environment:
       - REDIS_HOST=alak-redis:6379
-      - ALAK_URL=http://alak-geo:8081/lookup
+      - ALAK_GEO_URL=http://alak-geo:8081/lookup
       - HA_PROXY_URL=http://haproxy:80
+      - SKIP_TLS_VERIFY="true"
     depends_on:
       - alak-redis
 

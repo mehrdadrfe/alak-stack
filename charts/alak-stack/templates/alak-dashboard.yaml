@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alak-dashboard
+  labels:
+    app: alak-dashboard
+  annotations:
+    # Trigger rollout when ConfigMap changes (assumes you have a ConfigMap template at templates/configmap.yaml)
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+spec:
+  replicas: {{ .Values.alakDashboard.replicas | default 2 }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: alak-dashboard
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: alak-dashboard
+      annotations:
+        # Optional: let you add extra pod annotations from values
+        {{- with .Values.alakDashboard.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: alak-dashboard
+          image: {{ .Values.alakDashboard.image | quote }}
+          imagePullPolicy: {{ .Values.alakDashboard.imagePullPolicy | default "IfNotPresent" | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.alakDashboard.port | default 3000 }}
+          env:
+            - name: CONTROLLER_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: CONTROLLER_ORIGIN
+            - name: GEO_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: GEO_ORIGIN
+            - name: PORT
+              value: {{ (.Values.alakDashboard.port | default 3000) | quote }}
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            {{- with .Values.alakDashboard.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml ( .Values.alakDashboard.resources | default dict ) | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+          volumeMounts:
+            # Next can write small caches; give it a tmpfs instead of root
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.alakDashboard.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.alakDashboard.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.alakDashboard.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alak-dashboard
+  labels:
+    app: alak-dashboard
+spec:
+  selector:
+    app: alak-dashboard
+  ports:
+    - name: http
+      port: {{ .Values.alakDashboard.servicePort | default 80 }}
+      targetPort: http
+      protocol: TCP
+  type: {{ .Values.alakDashboard.serviceType | default "ClusterIP" }}
+---
+{{- if .Values.alakDashboard.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alak-dashboard
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "75s"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "75s"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    {{- with .Values.alakDashboard.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  tls:
+    - hosts:
+        - {{ .Values.alakDashboard.ingress.host | quote }}
+      secretName: {{ .Values.alakDashboard.ingress.tlsSecret | quote }}
+  rules:
+    - host: {{ .Values.alakDashboard.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: alak-dashboard
+                port:
+                  name: http
+{{- end }}

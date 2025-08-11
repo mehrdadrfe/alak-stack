@@ -1,117 +1,256 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
-async function loadMapping(setMapping) {
-  try {
-    const res = await fetch('/asn-country-map.json')
-    setMapping(res.ok ? await res.json() : {})
-  } catch {
-    setMapping({})
+const debounce = (fn, ms = 400) => {
+  let t
+  return (...args) => {
+    clearTimeout(t)
+    t = setTimeout(() => fn(...args), ms)
   }
-}
-
-function getCountry(asnValue, tspValue, mappingObj) {
-  let detected = ''
-  if (asnValue) detected = mappingObj[asnValue.toUpperCase()] || ''
-  if (!detected && tspValue) {
-    const found = Object.entries(mappingObj).find(
-      ([key, value]) => key.toLowerCase() === tspValue.toLowerCase()
-    )
-    detected = found ? found[1] : ''
-  }
-  return detected
 }
 
 export default function AddRuleForm() {
   const [asn, setAsn] = useState('')
   const [tsp, setTsp] = useState('')
   const [country, setCountry] = useState('')
+  const [city, setCity] = useState('')
   const [dropPercent, setDropPercent] = useState('')
+  const [enabled, setEnabled] = useState(true)
+
   const [message, setMessage] = useState(null)
-  const [mapping, setMapping] = useState({})
+  const [busy, setBusy] = useState(false)
 
-  useEffect(() => { loadMapping(setMapping) }, [])
+  const [tspList, setTspList] = useState([])
+  const [suggestions, setSuggestions] = useState([])
+  const hasSuggestions = suggestions && suggestions.length > 1
 
-  // User types: keep auto-fill
-  const handleAsnChange = (e) => {
-    const nextAsn = e.target.value
-    setAsn(nextAsn)
-    setCountry(getCountry(nextAsn, tsp, mapping))
+  const normASN = useMemo(() => asn.trim().toUpperCase(), [asn])
+  const normTSP = useMemo(() => tsp.trim().toLowerCase(), [tsp])
+
+  const clearMsgSoon = () => setTimeout(() => setMessage(null), 2500)
+
+  async function safeJSON(res) {
+    const text = await res.text()
+    try { return JSON.parse(text) } catch { return text || null }
   }
-  const handleTspChange = (e) => {
-    const nextTsp = e.target.value
-    setTsp(nextTsp)
-    setCountry(getCountry(asn, nextTsp, mapping))
+
+  async function lookupByASN(asnValue) {
+    if (!asnValue) return null
+    const res = await fetch(`/api/geo/lookup?asn=${encodeURIComponent(asnValue)}`)
+    if (res.status === 300) return safeJSON(res)
+    if (!res.ok) throw new Error(await res.text())
+    return res.json()
   }
 
-  // EXAMPLE: Async "search" for ASN/TSP from API
-  // Replace this with your real backend query
-  const handleAsyncSearch = async () => {
-    // Simulate a network request with a Promise
-    const found = await new Promise(resolve =>
-      setTimeout(() => resolve({
-        asn: 'AS44244',
-        tsp: 'iran cell service and communication company'
-      }), 400)
-    )
-    // Use results directly for country lookup
-    const foundCountry = getCountry(found.asn, found.tsp, mapping)
-    setAsn(found.asn)
-    setTsp(found.tsp)
-    setCountry(foundCountry)
+  async function lookupByTSP(tspValue) {
+    if (!tspValue) return null
+    const res = await fetch(`/api/geo/lookup?tsp=${encodeURIComponent(tspValue)}`)
+    if (res.status === 300) return safeJSON(res)
+    if (!res.ok) throw new Error(await res.text())
+    return res.json()
+  }
+
+  function applyLookup(obj) {
+    if (!obj) return
+    if (obj.asn) setAsn(obj.asn)
+    if (obj.tsp) setTsp(obj.tsp)
+    if (obj.country) setCountry(obj.country)
+    if (obj.city) setCity(obj.city || '')
+  }
+
+  useEffect(() => {
+    let alive = true
+    fetch('/api/geo/tsp-list')
+      .then(r => (r.ok ? r.json() : []))
+      .then(list => { if (alive) setTspList(Array.isArray(list) ? list : []) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  useEffect(() => {
+    const run = debounce(async (val) => {
+      if (!val) return
+      try {
+        const res = await lookupByASN(val)
+        if (Array.isArray(res)) setSuggestions(res)
+        else { setSuggestions([]); applyLookup(res) }
+      } catch {}
+    })
+    if (normASN && normASN.length >= 3) run(normASN)
+  }, [normASN])
+
+  useEffect(() => {
+    const run = debounce(async (val) => {
+      if (!val) return
+      try {
+        const res = await lookupByTSP(val)
+        if (Array.isArray(res)) setSuggestions(res)
+        else { setSuggestions([]); applyLookup(res) }
+      } catch {}
+    })
+    if (normTSP && normTSP.length >= 3) run(normTSP)
+  }, [normTSP])
+
+  const handlePickSuggestion = (s) => {
+    applyLookup(s)
+    setSuggestions([])
+    setMessage('✅ Filled from suggestions')
+    clearMsgSoon()
   }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setMessage(null)
-    const rule = { asn, tsp, country, drop_percent: parseInt(dropPercent, 10) }
+
+    const dp = Number(dropPercent)
+    if (!normASN || !normTSP || !country.trim()) {
+      setMessage('❌ ASN, TSP, and Country are required')
+      return
+    }
+    if (!Number.isFinite(dp) || dp < 0 || dp > 100) {
+      setMessage('❌ Drop% must be a number between 0–100')
+      return
+    }
+
+    const payload = {
+      asn: normASN,
+      tsp: normTSP,
+      country: country.trim().toUpperCase(),
+      drop_percent: dp,
+      enabled
+    }
+
     try {
-      const api = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080'
-      const res = await fetch(`${api}/rules`, {
+      setBusy(true)
+      const res = await fetch('/api/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(rule),
+        body: JSON.stringify(payload),
       })
-      if (!res.ok) throw new Error(await res.text() || 'Unknown error')
+      if (!res.ok) throw new Error(await safeJSON(res) || 'Unknown error')
       setMessage('✅ Rule added successfully')
-      setAsn(''); setTsp(''); setCountry(''); setDropPercent('')
+      setAsn(''); setTsp(''); setCountry(''); setCity(''); setDropPercent('')
+      setEnabled(true)
+      clearMsgSoon()
     } catch (err) {
-      console.error(err)
       setMessage('❌ Error adding rule')
+    } finally {
+      setBusy(false)
     }
   }
 
   return (
-    <form onSubmit={handleSubmit} style={{ maxWidth: 400 }}>
-      <h2>Add Load Shedding Rule</h2>
-      <div>
-        <label>ASN:</label>
-        <input value={asn} onChange={handleAsnChange} />
+    <form onSubmit={handleSubmit} style={{ maxWidth: 520 }}>
+      <h2 style={{ marginBottom: 10 }}>Add Load Shedding Rule</h2>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <label style={{ display: 'grid', gap: 6 }}>
+          <span>ASN</span>
+          <input
+            value={asn}
+            onChange={e => setAsn(e.target.value)}
+            placeholder="e.g., AS44244"
+            autoCapitalize="characters"
+          />
+        </label>
+
+        <label style={{ display: 'grid', gap: 6 }}>
+          <span>TSP (ISP)</span>
+          <input
+            list="tspList"
+            value={tsp}
+            onChange={e => setTsp(e.target.value)}
+            placeholder="e.g., irancell"
+          />
+          <datalist id="tspList">
+            {tspList.map((v, i) => <option key={i} value={v} />)}
+          </datalist>
+        </label>
+
+        <label style={{ display: 'grid', gap: 6 }}>
+          <span>Country</span>
+          <input
+            value={country}
+            onChange={e => setCountry(e.target.value)}
+            placeholder="e.g., IR"
+          />
+        </label>
+
+        <label style={{ display: 'grid', gap: 6 }}>
+          <span>City (from Geo)</span>
+          <input value={city} readOnly placeholder="auto (optional)" />
+        </label>
+
+        <label style={{ display: 'grid', gap: 6 }}>
+          <span>Drop Percent</span>
+          <input
+            type="number"
+            value={dropPercent}
+            onChange={e => setDropPercent(e.target.value)}
+            min={0}
+            max={100}
+            placeholder="0–100"
+          />
+        </label>
+
+        <label style={{ display: 'grid', gap: 6, alignItems: 'center' }}>
+          <span>Enabled</span>
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={e => setEnabled(e.target.checked)}
+          />
+        </label>
       </div>
-      <div>
-        <label>TSP:</label>
-        <input value={tsp} onChange={handleTspChange} />
+
+      {hasSuggestions && (
+        <div style={{
+          marginTop: 12, padding: 10, border: '1px solid #ddd',
+          borderRadius: 8, background: '#fafafa'
+        }}>
+          <div style={{ marginBottom: 6, fontWeight: 600 }}>
+            Multiple matches — pick one:
+          </div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {suggestions.map((s, i) => (
+              <li key={i} style={{ margin: '4px 0' }}>
+                <button
+                  type="button"
+                  onClick={() => handlePickSuggestion(s)}
+                  style={{
+                    border: '1px solid #ccc',
+                    borderRadius: 6,
+                    padding: '2px 8px',
+                    cursor: 'pointer',
+                    background: '#fff'
+                  }}
+                  title="Apply this match"
+                >
+                  {s.asn || '(asn?)'} · {s.country || '(country?)'} · {s.tsp || '(tsp?)'}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div style={{ marginTop: 14 }}>
+        <button
+          type="submit"
+          disabled={busy}
+          style={{
+            padding: '6px 14px',
+            borderRadius: 8,
+            border: '1px solid #ccc',
+            cursor: busy ? 'wait' : 'pointer',
+            background: busy ? '#eee' : '#e3f2fd'
+          }}
+        >
+          {busy ? 'Saving…' : 'Submit'}
+        </button>
+        {message && <span style={{ marginLeft: 12 }}>{message}</span>}
       </div>
-      <div>
-        <label>Country:</label>
-        <input value={country} onChange={e => setCountry(e.target.value)} />
-      </div>
-      <div>
-        <label>Drop Percent:</label>
-        <input
-          type="number"
-          value={dropPercent}
-          onChange={e => setDropPercent(e.target.value)}
-          min={0}
-          max={100}
-        />
-      </div>
-      <button type="submit">Submit</button>
-      <button type="button" onClick={handleAsyncSearch} style={{ marginLeft: 10 }}>
-        Async Search Example
-      </button>
-      {message && <p>{message}</p>}
     </form>
   )
 }

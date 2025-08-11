@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alak-controller
+  labels:
+    app: alak-controller
+  annotations:
+    # Rollout when ConfigMap changes (adjust path to your CM template)
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+spec:
+  replicas: {{ .Values.alakController.replicas | default 2 }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: alak-controller
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: alak-controller
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: alak-controller
+          image: {{ .Values.alakController.image | quote }}
+          imagePullPolicy: {{ .Values.alakController.imagePullPolicy | default "IfNotPresent" | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.alakController.port | default 8080 }}
+          env:
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: REDIS_HOST_CONTROLLER
+            - name: CORS_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: CORS_ORIGINS
+            - name: PORT
+              value: {{ (.Values.alakController.port | default 8080) | quote }}
+          readinessProbe:
+            httpGet:
+              path: /tsp-list   # cheap endpoint; or /health if you add it
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /tsp-list   # or /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml ( .Values.alakController.resources | default dict ) | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alak-controller
+  labels:
+    app: alak-controller
+spec:
+  selector:
+    app: alak-controller
+  ports:
+    - name: http
+      port: {{ .Values.alakController.servicePort | default 80 }}
+      targetPort: http
+      protocol: TCP
+  type: {{ .Values.alakController.serviceType | default "ClusterIP" }}
+---
+{{- if .Values.alakController.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alak-controller
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60s"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60s"
+    {{- with .Values.alakController.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  tls:
+    - hosts:
+        - {{ .Values.alakController.ingress.host | quote }}
+      secretName: {{ .Values.alakController.ingress.tlsSecret | quote }}
+  rules:
+    - host: {{ .Values.alakController.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: alak-controller
+                port:
+                  name: http
+{{- end }}

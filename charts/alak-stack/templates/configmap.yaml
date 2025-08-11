@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alak-env
+data:
+  # ---- Gatekeeper ----
+  REDIS_HOST: {{ default "alak-redis:6379" .Values.alakGatekeeper.env.REDIS_HOST | quote }}
+  ALAK_GEO_URL: {{ default "http://alak-geo:8081" .Values.alakGatekeeper.env.ALAK_GEO_URL | quote }}
+  HA_PROXY_URL: {{ .Values.alakGatekeeper.env.HA_PROXY_URL | quote }}
+  SKIP_TLS_VERIFY: {{ default "false" .Values.alakGatekeeper.env.SKIP_TLS_VERIFY | quote }}
+
+  # ---- Controller ----
+  # NOTE: controller code expects env NAME = REDIS_HOST.
+  # We'll map this key to that name in the controller Deployment.
+  REDIS_HOST_CONTROLLER: {{ default .Values.alakGatekeeper.env.REDIS_HOST .Values.alakController.env.REDIS_HOST | quote }}
+  CORS_ORIGINS: {{ default "" .Values.alakController.env.CORS_ORIGINS | quote }}
+
+  # ---- Dashboard ----
+  CONTROLLER_ORIGIN: {{ .Values.alakDashboard.env.CONTROLLER_ORIGIN | quote }}
+  GEO_ORIGIN: {{ .Values.alakDashboard.env.GEO_ORIGIN | quote }}
