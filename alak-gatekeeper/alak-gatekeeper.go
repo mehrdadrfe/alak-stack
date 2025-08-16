@@ -7,10 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -50,9 +51,15 @@ func cleanField(s string, isCountry bool) string {
 var (
 	ctx         = context.Background()
 	redisClient *redis.Client
-	geoURL      string
-	haProxyURL  string
-	proxyClient *http.Client
+
+	geoURL     string
+	haProxyURL string
+
+	// parsed upstream and global TLS flags for transport
+	hapURL           *url.URL
+	skipVerifyGlobal bool
+	reverseProxy     *httputil.ReverseProxy
+	sniOverride      = getenv("ALAK_SNI_OVERRIDE", "")
 
 	requests = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -68,8 +75,6 @@ var (
 		},
 		[]string{"asn", "country", "tsp"},
 	)
-
-	sniOverride = getenv("ALAK_SNI_OVERRIDE", "")
 )
 
 // ctx key to pass SNI (servername) into DialTLSContext
@@ -84,18 +89,30 @@ func main() {
 	geoURL = getenv("ALAK_GEO_URL", "http://alak-geo:8081/lookup")
 	haProxyURL = getenv("HA_PROXY_URL", "http://haproxy:80")
 
+	var err error
+	hapURL, err = url.Parse(haProxyURL)
+	if err != nil {
+		log.Fatalf("invalid HA_PROXY_URL %q: %v", haProxyURL, err)
+	}
+
 	redisHost := getenv("REDIS_HOST", "localhost:6379")
 	redisClient = redis.NewClient(&redis.Options{Addr: redisHost})
 
 	skipTLSVerify := strings.EqualFold(getenv("SKIP_TLS_VERIFY", "true"), "true")
+	skipVerifyGlobal = skipTLSVerify
 	if skipTLSVerify {
 		log.Printf("⚠️  SKIP_TLS_VERIFY=true — backend TLS certificate verification is disabled.")
 	}
 
-	proxyClient = newProxyClient(skipTLSVerify)
+	transport := newUpstreamTransport(skipTLSVerify)
+	reverseProxy = newReverseProxy(transport)
 
-	http.HandleFunc("/", proxyHandler)
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
 	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/", proxyHandler)
 
 	port := getenv("PORT", "8090")
 	log.Printf("Alak Gatekeeper listening on :%s (upstream=%s, geo=%s, skip_verify=%v, sni_override=%q)",
@@ -104,6 +121,7 @@ func main() {
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	// --- Client IP extraction (prefer XFF set by edge HAProxy) ---
 	ip := r.Header.Get("X-Forwarded-For")
 	if ip == "" {
 		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
@@ -114,30 +132,31 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- Geo lookup (fail-open) ---
 	lookupURL := fmt.Sprintf("%s?ip=%s", geoURL, ip)
 	resp, err := http.Get(lookupURL)
 	if err != nil {
 		log.Printf("[FAIL-OPEN] GeoIP lookup error for IP %s: %v; allowing request", ip, err)
-		proxyToHAProxy(w, r, ip)
+		reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
 		log.Printf("[PASS] No GeoIP data for IP %s", ip)
-		proxyToHAProxy(w, r, ip)
+		reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[FAIL-OPEN] GeoIP lookup failed for IP %s: status %d; allowing request", ip, resp.StatusCode)
-		proxyToHAProxy(w, r, ip)
+		reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 		return
 	}
 
 	var meta Meta
 	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
 		log.Printf("[FAIL-OPEN] Failed to decode GeoIP response for IP %s: %v; allowing request", ip, err)
-		proxyToHAProxy(w, r, ip)
+		reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 		return
 	}
 
@@ -166,12 +185,12 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		} else if err != nil {
 			log.Printf("[FAIL-OPEN] Redis get error: %v; allowing request", err)
-			proxyToHAProxy(w, r, ip)
+			reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 			return
 		}
 		if err := json.Unmarshal([]byte(val), &rule); err != nil {
 			log.Printf("[FAIL-OPEN] Failed to unmarshal rule at %s: %v; allowing request", key, err)
-			proxyToHAProxy(w, r, ip)
+			reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 			return
 		}
 		found = true
@@ -181,7 +200,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !found {
 		log.Printf("[PASS] No matching rule for IP=%s ASN=%q Country=%q TSP=%q", ip, meta.ASN, meta.Country, meta.TSP)
-		proxyToHAProxy(w, r, ip)
+		reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 		return
 	}
 
@@ -190,7 +209,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !rule.Enabled {
 		log.Printf("[PASS] Rule disabled for ASN=%q Country=%q TSP=%q", rule.ASN, rule.Country, rule.TSP)
-		proxyToHAProxy(w, r, ip)
+		reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 		return
 	}
 
@@ -203,7 +222,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[PASS] Request allowed for IP %s", ip)
-	proxyToHAProxy(w, r, ip)
+	reverseProxy.ServeHTTP(w, r.WithContext(withSNI(r.Context(), desiredSNI(r))))
 }
 
 func buildRuleKeys(meta Meta) []string {
@@ -229,76 +248,121 @@ func buildRuleKeys(meta Meta) []string {
 	return keys
 }
 
-func proxyToHAProxy(w http.ResponseWriter, r *http.Request, clientIP string) {
-	// Build upstream URL by concatenating base (scheme+host[:port]) with the original path + query
-	upURL := haProxyURL + r.URL.RequestURI()
+// ---- Reverse proxy (long-term solution) ----
 
-	req, err := http.NewRequest(r.Method, upURL, r.Body)
-	if err != nil {
-		log.Printf("[PROXY ERROR] newRequest(%s): %v", upURL, err)
-		http.Error(w, "Proxy error", http.StatusInternalServerError)
-		return
+func newReverseProxy(tr *http.Transport) *httputil.ReverseProxy {
+	rp := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			// Upstream target: edge HAProxy (scheme+host from HA_PROXY_URL)
+			req.URL.Scheme = hapURL.Scheme
+			req.URL.Host = hapURL.Host
+			// Keep origin-form path/query as sent by the client
+			// (ReverseProxy will clear RequestURI for us)
+
+			// Preserve Host for Ingress host-based routing (and for SNI via context)
+			cleanHost := desiredSNI(req)
+			req.Host = cleanHost
+			req.Header.Set("Host", cleanHost)
+
+			// Forward proto/host hints
+			if req.TLS != nil {
+				req.Header.Set("X-Forwarded-Proto", "https")
+			} else {
+				req.Header.Set("X-Forwarded-Proto", "http")
+			}
+			req.Header.Set("X-Forwarded-Host", cleanHost)
+
+			// Let ReverseProxy append X-Forwarded-For; ensure existing chain remains
+			// (no change needed; it preserves existing header and appends RemoteAddr)
+
+			// Inject per-request SNI for upstream TLS handshakes
+			ctx := withSNI(req.Context(), cleanHost)
+			*req = *req.WithContext(ctx)
+		},
+		Transport: tr,
+		ErrorLog:  log.New(os.Stdout, "[reverse-proxy] ", log.LstdFlags),
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[PROXY ERROR] %s %s: %v", r.Method, r.URL.String(), err)
+			http.Error(w, "Upstream error", http.StatusBadGateway)
+		},
+	}
+	return rp
+}
+
+// Build an upstream transport that:
+// - disables HTTP/2 (WebSocket Upgrade stays on HTTP/1.1)
+// - injects SNI per request via context
+// - has no overall request timeout (long-lived WS)
+// - sets conservative, sane dial/idle timeouts
+func newUpstreamTransport(skipVerify bool) *http.Transport {
+	baseTLS := &tls.Config{
+		InsecureSkipVerify: skipVerify,           // set false when proper CA is mounted
+		NextProtos:         []string{"http/1.1"}, // advertise h1 only
+		MinVersion:         tls.VersionTLS12,
 	}
 
-	// Copy all headers as-is
-	for h, vals := range r.Header {
-		for _, v := range vals {
-			req.Header.Add(h, v)
+	dialer := &net.Dialer{
+		Timeout:   15 * time.Second,
+		KeepAlive: 60 * time.Second,
+	}
+
+	tr := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		DialContext:         dialer.DialContext,
+		ForceAttemptHTTP2:   false,                                                  // disable h2
+		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // no h2
+		MaxIdleConns:        512,
+		IdleConnTimeout:     120 * time.Second,
+		TLSHandshakeTimeout: 15 * time.Second,
+		// ResponseHeaderTimeout: applies only to headers. Keep modest to not hang handshakes:
+		ResponseHeaderTimeout: 15 * time.Second,
+		// DisableCompression: false (fine; WS frames are not affected)
+	}
+
+	// Per-request SNI injection for TLS
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
 		}
+		serverName := ""
+		if v := ctx.Value(sniCtxKey{}); v != nil {
+			if s, ok := v.(string); ok {
+				serverName = s
+			}
+		}
+		if serverName == "" {
+			if host, _, _ := net.SplitHostPort(addr); host != "" {
+				serverName = host
+			}
+		}
+		cfg := baseTLS.Clone()
+		cfg.ServerName = serverName
+
+		tlsConn := tls.Client(raw, cfg)
+		if err := tlsConn.Handshake(); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("tls handshake to %s with SNI=%q failed: %w", addr, serverName, err)
+		}
+		return tlsConn, nil
 	}
 
-	// Determine clean host for Ingress routing & SNI (no :port)
+	return tr
+}
+
+func withSNI(ctx context.Context, sni string) context.Context {
+	return context.WithValue(ctx, sniCtxKey{}, sni)
+}
+
+func desiredSNI(r *http.Request) string {
 	cleanHost := hostNoPort(r.Host)
 	if sniOverride != "" {
 		cleanHost = sniOverride
 	}
-
-	// Preserve Host for Ingress host-based routing
-	req.Host = cleanHost
-	req.Header.Set("Host", cleanHost)
-
-	// Forward proto/host hints
-	if r.TLS != nil {
-		req.Header.Set("X-Forwarded-Proto", "https")
-	} else {
-		req.Header.Set("X-Forwarded-Proto", "http")
-	}
-	req.Header.Set("X-Forwarded-Host", cleanHost)
-
-	// XFF chain
-	existing := r.Header.Get("X-Forwarded-For")
-	if existing != "" && !strings.Contains(existing, clientIP) {
-		req.Header.Set("X-Forwarded-For", existing+", "+clientIP)
-	} else if existing == "" {
-		req.Header.Set("X-Forwarded-For", clientIP)
-	}
-
-	// Use a fresh, bounded context so upstream isn’t killed by client jitter
-	ctxUp, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	ctxUp = context.WithValue(ctxUp, sniCtxKey{}, cleanHost)
-	req = req.WithContext(ctxUp)
-
-	log.Printf("[PROXY → INGRESS] url=%s host=%q sni=%q method=%s", upURL, cleanHost, cleanHost, r.Method)
-
-	resp, err := proxyClient.Do(req)
-	if err != nil {
-		log.Printf("[PROXY ERROR] client.Do url=%s host=%q sni=%q: %v", upURL, cleanHost, cleanHost, err)
-		http.Error(w, "Upstream HAProxy error", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Copy response headers
-	for k, vals := range resp.Header {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	return cleanHost
 }
+
+// ---- utils ----
 
 func hashIP(ip string) int {
 	h := fnv.New32a()
@@ -321,66 +385,4 @@ func hostNoPort(h string) string {
 		return nh
 	}
 	return h
-}
-
-// --- HTTP client with per-request SNI injection, h2 disabled, and no redirect follow ---
-
-func newProxyClient(skipVerify bool) *http.Client {
-	baseTLS := &tls.Config{
-		InsecureSkipVerify: skipVerify,           // set to false once CA is mounted
-		NextProtos:         []string{"http/1.1"}, // advertise h1 only
-		MinVersion:         tls.VersionTLS12,
-	}
-
-	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 60 * time.Second}
-
-	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
-		ForceAttemptHTTP2:     false,                                                  // disable h2 to avoid cancel-on-upgrade quirks
-		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // no h2
-		MaxIdleConns:          512,
-		IdleConnTimeout:       120 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		ExpectContinueTimeout: 2 * time.Second,
-	}
-
-	// Inject SNI (servername) from request context, then do TLS handshake
-	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		raw, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		serverName := ""
-		if v := ctx.Value(sniCtxKey{}); v != nil {
-			if s, ok := v.(string); ok {
-				serverName = s
-			}
-		}
-		if serverName == "" {
-			if host, _, _ := net.SplitHostPort(addr); host != "" {
-				serverName = host
-			}
-		}
-
-		cfg := baseTLS.Clone()
-		cfg.ServerName = serverName
-
-		tlsConn := tls.Client(raw, cfg)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = raw.Close()
-			return nil, fmt.Errorf("tls handshake to %s with SNI=%q failed: %w", addr, serverName, err)
-		}
-		return tlsConn, nil
-	}
-
-	return &http.Client{
-		Transport: tr,
-		Timeout:   25 * time.Second,
-		// Critical for browser-driven auth flows: do NOT follow upstream redirects.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
 }
