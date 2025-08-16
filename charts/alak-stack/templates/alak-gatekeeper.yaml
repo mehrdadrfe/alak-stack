@@ -16,7 +16,8 @@ spec:
         - name: alak-gatekeeper
           image: {{ .Values.alakGatekeeper.image }}
           ports:
-            - containerPort: {{ .Values.alakGatekeeper.port }}
+            - name: http
+              containerPort: {{ .Values.alakGatekeeper.port }}
           env:
             - name: REDIS_HOST
               valueFrom:
@@ -38,6 +39,28 @@ spec:
                 configMapKeyRef:
                   name: alak-env
                   key: SKIP_TLS_VERIFY
+            - name: ALAK_SNI_OVERRIDE
+              valueFrom:
+                configMapKeyRef:
+                  name: alak-env
+                  key: ALAK_SNI_OVERRIDE
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+
 ---
 apiVersion: v1
 kind: Service
@@ -67,7 +90,7 @@ spec:
     matchNames:
       - {{ .Release.Namespace }}
   endpoints:
-    - port: http  # or "metrics" if you add a second port
+    - port: http
       path: {{ .Values.alakGatekeeper.serviceMonitor.path }}
       interval: {{ .Values.alakGatekeeper.serviceMonitor.interval }}
 {{- end }}

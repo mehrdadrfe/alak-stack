@@ -5,9 +5,10 @@ metadata:
 data:
   # ---- Gatekeeper ----
   REDIS_HOST: {{ default "alak-redis:6379" .Values.alakGatekeeper.env.REDIS_HOST | quote }}
-  ALAK_GEO_URL: {{ default "http://alak-geo:8081" .Values.alakGatekeeper.env.ALAK_GEO_URL | quote }}
+  ALAK_GEO_URL: {{ default "http://alak-geo:8081/lookup" .Values.alakGatekeeper.env.ALAK_GEO_URL | quote }}
   HA_PROXY_URL: {{ .Values.alakGatekeeper.env.HA_PROXY_URL | quote }}
   SKIP_TLS_VERIFY: {{ default "false" .Values.alakGatekeeper.env.SKIP_TLS_VERIFY | quote }}
+  ALAK_SNI_OVERRIDE: {{ default "" .Values.alakGatekeeper.env.ALAK_SNI_OVERRIDE | quote }}
 
   # ---- Controller ----
   # NOTE: controller code expects env NAME = REDIS_HOST.
