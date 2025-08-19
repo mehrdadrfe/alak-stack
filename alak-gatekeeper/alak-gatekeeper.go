@@ -204,8 +204,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deterministic shedding using (ip, asn, tsp)
+	hash := hashKey(ip, meta.ASN, meta.TSP)
+
 	log.Printf("[RULE MATCH] key=%s IP=%s ASN=%q Country=%q TSP=%q Drop%%=%d Enabled=%v Hash=%d",
-		bestKey, ip, rule.ASN, rule.Country, rule.TSP, rule.DropPercent, rule.Enabled, hashIP(ip))
+		bestKey, ip, rule.ASN, rule.Country, rule.TSP, rule.DropPercent, rule.Enabled, hash)
 
 	if !rule.Enabled {
 		log.Printf("[PASS] Rule disabled for ASN=%q Country=%q TSP=%q", rule.ASN, rule.Country, rule.TSP)
@@ -213,11 +216,13 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash := hashIP(ip)
 	if hash < rule.DropPercent {
 		drops.With(labels).Inc()
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte("Request blocked by Alak Gatekeeper\n"))
+		// Explicit shedding response (429) so upstream proxies don't transform to 5xx.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests) // 429
+		_, _ = w.Write([]byte("shed\n"))
 		return
 	}
 
@@ -256,8 +261,6 @@ func newReverseProxy(tr *http.Transport) *httputil.ReverseProxy {
 			// Upstream target: edge HAProxy (scheme+host from HA_PROXY_URL)
 			req.URL.Scheme = hapURL.Scheme
 			req.URL.Host = hapURL.Host
-			// Keep origin-form path/query as sent by the client
-			// (ReverseProxy will clear RequestURI for us)
 
 			// Preserve Host for Ingress host-based routing (and for SNI via context)
 			cleanHost := desiredSNI(req)
@@ -271,9 +274,6 @@ func newReverseProxy(tr *http.Transport) *httputil.ReverseProxy {
 				req.Header.Set("X-Forwarded-Proto", "http")
 			}
 			req.Header.Set("X-Forwarded-Host", cleanHost)
-
-			// Let ReverseProxy append X-Forwarded-For; ensure existing chain remains
-			// (no change needed; it preserves existing header and appends RemoteAddr)
 
 			// Inject per-request SNI for upstream TLS handshakes
 			ctx := withSNI(req.Context(), cleanHost)
@@ -307,16 +307,14 @@ func newUpstreamTransport(skipVerify bool) *http.Transport {
 	}
 
 	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		DialContext:         dialer.DialContext,
-		ForceAttemptHTTP2:   false,                                                  // disable h2
-		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // no h2
-		MaxIdleConns:        512,
-		IdleConnTimeout:     120 * time.Second,
-		TLSHandshakeTimeout: 15 * time.Second,
-		// ResponseHeaderTimeout: applies only to headers. Keep modest to not hang handshakes:
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     false,                                                  // disable h2
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // no h2
+		MaxIdleConns:          512,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
-		// DisableCompression: false (fine; WS frames are not affected)
 	}
 
 	// Per-request SNI injection for TLS
@@ -364,9 +362,13 @@ func desiredSNI(r *http.Request) string {
 
 // ---- utils ----
 
-func hashIP(ip string) int {
+func hashKey(ip, asn, tsp string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(ip))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(asn))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(tsp))
 	return int(h.Sum32() % 100)
 }
 
